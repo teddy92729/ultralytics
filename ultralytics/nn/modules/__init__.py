@@ -59,6 +59,10 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    Slice,
+    Add,
+    Harmonic,
+    Select,
 )
 from .conv import (
     CBAM,

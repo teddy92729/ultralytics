@@ -1945,3 +1945,40 @@ class SAVPE(nn.Module):
         aggregated = score.transpose(-2, -3) @ x.reshape(B, self.c, C // self.c, -1).transpose(-1, -2)
 
         return F.normalize(aggregated.transpose(-2, -3).reshape(B, Q, -1), dim=-1, p=2)
+
+
+class Slice(nn.Module):
+    def __init__(self, start=0, end=None):
+        super().__init__()
+        self.start = start
+        self.end = end
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        if self.end is not None and self.end > C:
+            pad = torch.zeros(B, self.end - C, H, W, device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=1)
+        x = x[:, self.start : self.end, :, :]
+        return x
+
+
+class Add(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
+        return torch.stack(x, dim=0).sum(dim=0)
+
+class Harmonic(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
+        return 2 *(x[0] * x[1]) / (x[0] + x[1] + 1e-30)
+
+class Select(nn.Module):
+    def __init__(self, index=0):
+        super().__init__()
+        self.index = index
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
+        return x[self.index]
