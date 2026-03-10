@@ -1646,6 +1646,16 @@ def parse_model(d, ch, verbose=True):
             c2 = args[0]
             c1 = ch[f]
             args = [*args[1:]]
+        elif m is Add:
+            c2 = ch[f[0]]
+        elif m is Slice:
+            if len(args) == 0:
+                args = [0, ch[f]]
+            elif len(args) == 1:
+                args.append(ch[f])
+            c2 = args[1] - args[0]
+        elif m is Select:
+            c2 = ch[f[args[0]]]
         else:
             c2 = ch[f]
 
