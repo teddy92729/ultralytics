@@ -1969,12 +1969,6 @@ class Add(nn.Module):
     def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
         return torch.stack(x, dim=0).sum(dim=0)
 
-class Harmonic(nn.Module):
-    def __init__(self):
-        super().__init__()
-    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
-        return 2 *(x[0] * x[1]) / (x[0] + x[1] + 1e-30)
-
 class Select(nn.Module):
     def __init__(self, index=0):
         super().__init__()

@@ -70,7 +70,6 @@ from ultralytics.nn.modules import (
     v10Detect,
     Slice,
     Add,
-    Harmonic,
     Select,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis

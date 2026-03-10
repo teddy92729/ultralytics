@@ -61,7 +61,6 @@ from .block import (
     TorchVision,
     Slice,
     Add,
-    Harmonic,
     Select,
 )
 from .conv import (
