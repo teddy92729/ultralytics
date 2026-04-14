@@ -1,0 +1,80 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Ultralytics YOLOv8-obb Oriented Bounding Boxes (OBB) model with P3/8 - P5/32 outputs
+# Model docs: https://docs.ultralytics.com/models/yolov8
+# Task docs: https://docs.ultralytics.com/tasks/obb
+
+# Parameters
+nc: 5 # number of classes
+scales: # model compound scaling constants, i.e. 'model=yolov8n-obb.yaml' will call yolov8-obb.yaml with scale 'n'
+  # [depth, width, max_channels]
+  # n: [0.33, 0.25, 1024] # YOLOv8n-obb summary: 144 layers, 3228867 parameters, 3228851 gradients, 9.1 GFLOPs
+  s: [0.33, 0.50, 1024] # YOLOv8s-obb summary: 144 layers, 11452739 parameters, 11452723 gradients, 29.8 GFLOPs
+  # m: [0.67, 0.75, 768] # YOLOv8m-obb summary: 184 layers, 26463235 parameters, 26463219 gradients, 81.5 GFLOPs
+  # l: [1.00, 1.00, 512] # YOLOv8l-obb summary: 224 layers, 44540355 parameters, 44540339 gradients, 169.4 GFLOPs
+  # x: [1.00, 1.25, 512] # YOLOv8x-obb summary: 224 layers, 69555651 parameters, 69555635 gradients, 264.3 GFLOPs
+# YOLOv8.0n backbone
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Slice, []] # 0
+
+  # RGB branch
+  - [0, 1, Slice, [0, 3]] # 1
+  - [-1, 1, Conv, [64, 3, 2]] # 2
+  - [-1, 1, Conv, [128, 3, 2]] # 3
+  - [-1, 3, DRAF, [128]] # 4
+  # Thermal branch
+  - [0, 1, Slice, [3, 4]] # 5
+  - [-1, 1, Conv, [64, 3, 2]] # 6
+  - [-1, 1, Conv, [128, 3, 2]] # 7
+  - [-1, 3, AFEA, [128]] # 8
+  # Fusion
+  - [[4, 8], 1, SCMF, [128]] # 9
+
+  # RGB branch
+  - [9, 1, Conv, [256, 3, 2]] # 10
+  - [-1, 6, DRAF, [256]] # 11
+  # Thermal branch
+  - [9, 1, Conv, [256, 3, 2]] # 12
+  - [-1, 6, AFEA, [256]] # 13
+  # Fusion
+  - [[-3, -1], 1, SCMF, [256]] # 14
+  
+  # RGB branch
+  - [14, 1, Conv, [512, 3, 2]] # 15
+  - [-1, 6, DRAF, [512]] # 16
+  # Thermal branch
+  - [14, 1, Conv, [512, 3, 2]] # 17
+  - [-1, 6, AFEA, [512]] # 18
+  # Fusion
+  - [[-3, -1], 1, SCMF, [512]] # 19
+
+  # RGB branch
+  - [19, 1, Conv, [1024, 3, 2]] # 20
+  - [-1, 3, DRAF, [1024]] # 21
+  # Thermal branch
+  - [19, 1, Conv, [1024, 3, 2]] # 22
+  - [-1, 3, AFEA, [1024]] # 23
+  # Fusion
+  - [[-3, -1], 1, SCMF, [1024]] # 24
+  - [-1, 1, SPPF, [1024, 5]] # 25
+
+# YOLOv8.0n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 26
+  - [[-1, 19], 1, Concat, [1]] # 27 cat backbone P4 
+  - [-1, 3, C2f, [512]] # 28
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]] # 29
+  - [[-1, 14], 1, Concat, [1]] # 30 cat backbone P3
+  - [-1, 3, C2f, [256]] # 31 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]] # 32
+  - [[-1, 28], 1, Concat, [1]] # 33 cat head P4
+  - [-1, 3, C2f, [512]] # 34 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]] # 35
+  - [[-1, 25], 1, Concat, [1]] # 36 cat head P5
+  - [-1, 3, C2f, [1024]] # 37 (P5/32-large)
+
+  - [[31, 34, 37], 1, OBB, [nc, 1]] # OBB(P3, P4, P5)

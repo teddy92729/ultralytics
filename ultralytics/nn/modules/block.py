@@ -12,6 +12,8 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 
+import math
+
 __all__ = (
     "C1",
     "C2",
@@ -1976,3 +1978,418 @@ class Select(nn.Module):
 
     def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
         return x[self.index]
+
+
+class SRFE(nn.Module):
+    """空間感知感受視野增強 (Spatial-aware Receptive Field Enhancement)
+
+    透過 unfold 展開操作將固定卷積轉為動態加權聚合，
+    每個空間位置根據自身特徵學習不同的鄰域聚合權重，實現自適應感受視野。
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 3):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.k2 = kernel_size * kernel_size
+
+        # 空間感知權重: Conv_9x9([AMP(x), AVP(x)]) → σ
+        self.spatial_conv = nn.Conv2d(2, 1, kernel_size=9, padding=4, bias=False)
+
+        # 動態權重生成: GConv → BN → Reshape → Softmax
+        self.gconv = nn.Conv2d(
+            channels * self.k2,
+            channels * self.k2,
+            kernel_size=1,
+            groups=channels,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm2d(channels * self.k2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+
+        # --- 空間感知權重 W_s ---
+        amp = x.mean(dim=1, keepdim=True)  # AMP: (B,1,H,W)
+        avp = x.var(dim=1, keepdim=True)  # AVP: (B,1,H,W)
+        w_s = torch.sigmoid(
+            self.spatial_conv(
+                torch.cat([amp, avp], dim=1),
+            )
+        )  # (B,1,H,W)
+
+        x_prime = w_s * x  # 加權 x' = W_s ⊙ x
+
+        # --- Unfold 展開 ---
+        pad = self.kernel_size // 2
+        x_unfolded = F.unfold(x_prime, kernel_size=self.kernel_size, padding=pad)
+        x_unfolded = x_unfolded.view(B, C * self.k2, H, W)
+
+        # --- 動態權重 ---
+        weight = self.gconv(x_unfolded)
+        weight = self.bn(weight)
+        weight = weight.view(B, C, self.k2, H, W)
+        weight = F.softmax(weight, dim=2)
+
+        # --- 加權聚合 ---
+        x_unfolded = x_unfolded.view(B, C, self.k2, H, W)
+        f_z = (x_unfolded * weight).sum(dim=2)  # (B, C, H, W)
+
+        return f_z
+
+
+class DFA(nn.Module):
+    """動態特徵聚合 (Dynamic Feature Aggregation)
+
+    包含兩個分支:
+    - GAI (全域注意力推理): 下採樣 + 深度卷積 + 全域方差調制 → 非局部特徵
+    - LFE (局部特徵估計): 擴展深度卷積 → 局部細節估計
+    """
+
+    def __init__(self, channels: int, reduction: int = 2):
+        super().__init__()
+        mid = channels // reduction
+
+        # 輸入正規化 + 分割: Conv_1×1 生成兩個分支
+        self.norm_conv1 = nn.Conv2d(channels, mid, 1, bias=False)
+        self.norm_conv2 = nn.Conv2d(channels, mid, 1, bias=False)
+
+        # === GAI 分支 ===
+        self.downsample = nn.AdaptiveAvgPool2d(None)  # 將由 forward 中直接下採樣
+        self.gai_dwconv = nn.Conv2d(mid, mid, 3, padding=1, groups=mid, bias=False)
+        self.gai_fuse = nn.Conv2d(mid, mid, 1, bias=False)
+        self.gai_act = nn.GELU()
+
+        # === LFE 分支 ===
+        self.lfe_dwconv = nn.Conv2d(mid, mid, 3, padding=2, dilation=2, groups=mid, bias=False)
+        self.lfe_conv1 = nn.Conv2d(mid, mid, 1, bias=False)
+        self.lfe_act = nn.GELU()
+        self.lfe_conv2 = nn.Conv2d(mid, mid, 1, bias=False)
+
+        # 最終聚合
+        self.out_conv = nn.Conv2d(mid, channels, 1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+
+        # L2 正規化後分割為兩個分支
+        x_norm = F.normalize(x, p=2, dim=1)
+        x1 = self.norm_conv1(x_norm)  # GAI 分支輸入
+        x2 = self.norm_conv2(x_norm)  # LFE 分支輸入
+
+        # === GAI: 全域注意力推理 ===
+        # 下採樣
+        h_down, w_down = max(H // 2, 1), max(W // 2, 1)
+        x1_down = F.adaptive_avg_pool2d(x1, (h_down, w_down))
+
+        # 深度卷積
+        x_s = self.gai_dwconv(x1_down)
+
+        # 全域方差調制
+        variance = x1_down.var(dim=[2, 3], keepdim=True)  # σ²(X_i)
+        x_m = self.gai_fuse(x_s + variance)
+
+        # 上採樣 + 啟動
+        x_g = F.interpolate(self.gai_act(x_m), size=(H, W), mode="bilinear", align_corners=False)
+
+        # === LFE: 局部特徵估計 ===
+        y_h = self.lfe_conv1(self.lfe_dwconv(x2))
+        x_l = self.lfe_conv2(self.lfe_act(y_h))
+
+        # === 聚合 ===
+        f_d = self.out_conv(x_g + x_l)
+        return f_d
+
+
+class AFEA(nn.Module):
+    """自適應特徵增強聚合 (Adaptive Feature Enhancement Aggregation)
+
+    結合 DFA 與 SRFE 兩個子模組，增強 IR 路徑的特徵表達。
+
+    公式:
+        F_AFEA = σ(BN(F_d + F_z))
+    """
+
+    def __init__(self, channels: int, kernel_size: int = 3, reduction: int = 2):
+        super().__init__()
+        self.dfa = DFA(channels, reduction=reduction)
+        self.srfe = SRFE(channels, kernel_size=kernel_size)
+        self.bn = nn.BatchNorm2d(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) — IR 分支特徵圖
+        Returns:
+            F_AFEA: (B, C, H, W)
+        """
+        f_d = self.dfa(x)  # 動態特徵聚合
+        f_z = self.srfe(x)  # 空間感知感受視野增強
+        return torch.sigmoid(self.bn(f_d + f_z))
+
+
+class SCMF(nn.Module):
+    """語意引導跨模態融合 (Semantic-guided Cross-Modal Fusion)
+
+    透過語意引導注意力 (SGA) 為每個通道生成獨立的空間重要性圖，
+    實現細粒度的跨模態特徵對齊與融合。
+    """
+
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(channels // reduction, 1)
+
+        # --- 空間注意力 ---
+        # GAP/GMP 沿空間維度 → concat → Conv_7×7
+        self.spatial_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+
+        # --- 通道注意力分支 1: GAP → Conv1×1 → ReLU → Conv1×1 ---
+        self.ch_fc1 = nn.Conv2d(channels, mid, 1, bias=False)
+        self.ch_relu = nn.ReLU(inplace=True)
+        self.ch_fc2 = nn.Conv2d(mid, channels, 1, bias=False)
+
+        # --- 通道注意力分支 2: Conv1×1 → Conv3×3 → Conv1×1 ---
+        self.ch_conv1 = nn.Conv2d(channels, mid, 1, bias=False)
+        self.ch_conv3 = nn.Conv2d(mid, mid, 3, padding=1, bias=False)
+        self.ch_conv2 = nn.Conv2d(mid, channels, 1, bias=False)
+
+        # --- 精煉 SIM: GConv_7×7 ---
+        # 輸入為 [X, W_coa] concat 後 2*channels
+        self.refine_conv = nn.Conv2d(
+            channels * 2,
+            channels,
+            kernel_size=7,
+            padding=3,
+            groups=channels,
+            bias=False,
+        )
+
+        # --- 融合輸出 ---
+        self.fuse_conv = nn.Conv2d(channels, channels, 1, bias=False)
+
+    def forward(self, x: list[torch.Tensor]) -> torch.Tensor:
+        f_rgb, f_ir = x
+        # 拼接輸入用於注意力計算
+        f_c = f_rgb + f_ir
+
+        # === 空間注意力 W_s ===
+        gap_s = f_c.mean(dim=1, keepdim=True)  # (B,1,H,W)
+        gmp_s, _ = f_c.max(dim=1, keepdim=True)  # (B,1,H,W)
+        w_s = self.spatial_conv(torch.cat([gap_s, gmp_s], dim=1))  # (B,1,H,W)
+
+        # === 通道注意力 W_c ===
+        # 分支1: GAP → FC → ReLU → FC
+        gap_c = F.adaptive_avg_pool2d(f_c, 1)  # (B,C,1,1)
+        w_c1 = self.ch_fc2(self.ch_relu(self.ch_fc1(gap_c)))  # (B,C,1,1)
+
+        # 分支2: Conv1×1 → Conv3×3 → Conv1×1
+        w_c2 = self.ch_conv2(self.ch_conv3(self.ch_conv1(f_c)))  # (B,C,H,W)
+
+        w_c = w_c1 + w_c2  # (B,C,H,W)
+
+        # === 粗糙 SIM ===
+        w_coa = w_c + w_s  # (B,C,H,W)
+
+        # === 精煉 SIM ===
+        # CS = channel shuffle (此處用 concat + group conv 近似)
+        w = torch.sigmoid(
+            self.refine_conv(
+                torch.cat([f_c, w_coa], dim=1),
+            )
+        )  # (B,C,H,W)
+
+        # === 融合輸出 ===
+        f_fuse = self.fuse_conv(f_ir * w + f_rgb * (1 - w) + f_rgb + f_ir)
+        return f_fuse
+
+
+class DRAF(nn.Module):
+    """動態感受視野注意力融合 (Dynamic Receptive Field Attention Fusion)
+
+    針對 RGB 路徑的特徵增強，透過通道與空間注意力的聯合動態加權，
+    增強低光環境下的特徵擷取能力。
+    """
+
+    def __init__(self, channels: int, reduction: int = 4, groups: int = 4):
+        super().__init__()
+        mid = max(channels // reduction, 1)
+
+        # === 通道注意力 ===
+        # GAP + GMP → 共用 MLP
+        self.ch_fc1 = nn.Conv2d(channels, mid, 1, bias=False)
+        self.ch_relu = nn.ReLU(inplace=True)
+        self.ch_fc2 = nn.Conv2d(mid, channels, 1, bias=False)
+
+        # === 感受視野編碼 ===
+        self.rf_gconv = nn.Conv2d(channels, channels, 3, padding=1, groups=groups, bias=False)
+        self.rf_bn = nn.BatchNorm2d(channels)
+
+        # === 空間注意力 ===
+        # 沿通道維度 Avg/Max → Conv_7×7
+        self.sp_conv = nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False)
+
+        # === 輸出卷積 ===
+        self.out_conv = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # === 感受視野編碼 ===
+        x_r = self.rf_bn(self.rf_gconv(x))  # (B,C,H,W)
+
+        # === 通道注意力 W_c ===
+        gap = F.adaptive_avg_pool2d(x_r, 1)  # (B,C,1,1)
+        gmp = F.adaptive_max_pool2d(x_r, 1)  # (B,C,1,1)
+        w_c = torch.sigmoid(self.ch_fc2(self.ch_relu(self.ch_fc1(gap))) + self.ch_fc2(self.ch_relu(self.ch_fc1(gmp))))  # (B,C,1,1)
+
+        # === 空間注意力 W_s ===
+        avg_s = x_r.mean(dim=1, keepdim=True)  # (B,1,H,W)
+        max_s, _ = x_r.max(dim=1, keepdim=True)  # (B,1,H,W)
+        w_s = torch.sigmoid(
+            self.sp_conv(
+                torch.cat([avg_s, max_s], dim=1),
+            )
+        )  # (B,1,H,W)
+
+        # === 動態加權 ===
+        w = w_c * w_s  # (B,C,H,W)
+        y_w = w * x_r  # (B,C,H,W)
+
+        x_out = self.out_conv(y_w)
+        return x_out
+
+
+class SWSP(nn.Module):
+    """
+    Saliency Weighted Spatial Pooling (SWSP) module for adaptive spatial feature aggregation based on saliency maps.
+    """
+
+    def __init__(self, c1):
+        super().__init__()
+
+        self.max_pool = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
+        self.avg_pool = nn.AvgPool2d(kernel_size=7, stride=1, padding=3)
+
+        self.weight = nn.Parameter(torch.empty((c1, c1)), requires_grad=True)
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        self.ln = nn.LayerNorm(c1)
+
+        self.spatial_conv = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.BatchNorm2d(1),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        max_x = torch.amax(x, dim=1, keepdim=True)
+
+        x = self.max_pool(x) - self.avg_pool(x)
+        x_c = F.adaptive_avg_pool2d(x, 1).view(B, C)
+        x_c = torch.einsum("bc,cd->bd", x_c, self.weight)
+        x_c = F.softmax(self.ln(x_c), dim=1)
+        x = (x * x_c.view(B, C, 1, 1)).sum(dim=1, keepdim=True)
+
+        x = torch.cat([x, max_x], dim=1)
+        x = self.spatial_conv(x)
+
+        return x
+
+
+class DecoupledAttn(nn.Module):
+    def __init__(self, c1: int, k: int = 1):
+        super().__init__()
+
+        self.k = k
+        self.k2c = k**2 * c1
+        self.unfold = nn.Unfold(kernel_size=k, padding=k // 2)
+        self.inner_dim = c1
+
+        self.inner_proj1 = nn.Parameter(torch.empty(self.k2c, self.inner_dim), requires_grad=True)
+        self.inner_proj2 = nn.Parameter(torch.empty(self.k2c, self.inner_dim), requires_grad=True)
+        self.out_proj1 = nn.Parameter(torch.empty(self.k2c, c1), requires_grad=True)
+        self.out_proj2 = nn.Parameter(torch.empty(self.k2c, c1), requires_grad=True)
+        torch.nn.init.kaiming_uniform_(self.inner_proj1, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(self.inner_proj2, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(self.out_proj1, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(self.out_proj2, a=math.sqrt(5))
+
+        self.bn1 = nn.BatchNorm2d(c1)
+        self.bn2 = nn.BatchNorm2d(c1)
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        a0, b0 = x
+        assert a0.shape == b0.shape, "Input tensors must have the same shape"
+        B, C, H, W = a0.shape
+        dtype = a0.dtype
+
+        with torch.autocast(device_type=a0.device.type, enabled=False):
+
+            a = a0.float()
+            a = self.unfold(a).view(B, self.k2c, H, W)
+            b = b0.float()
+            b = self.unfold(b).view(B, self.k2c, H, W)
+
+            in_w1 = self.inner_proj1.float()
+            in_w2 = self.inner_proj2.float()
+
+            pinv1 = torch.linalg.pinv(in_w1, rcond=1e-5)
+            pinv2 = torch.linalg.pinv(in_w2, rcond=1e-5)
+            out_w1 = self.out_proj1.float()
+            out_w2 = self.out_proj2.float()
+
+            a_prj = torch.einsum("bchw,cd->bdhw", a, in_w1)
+            b_prj = torch.einsum("bchw,cd->bdhw", b, in_w2)
+
+            similarity = torch.cosine_similarity(a_prj, b_prj, dim=1, eps=1e-8).unsqueeze(1)
+            tmp_a_prj = a_prj + b_prj * similarity
+            tmp_b_prj = b_prj + a_prj * similarity
+
+            a = torch.einsum("bdhw,dc->bchw", tmp_a_prj, pinv1 @ out_w1)
+            b = torch.einsum("bdhw,dc->bchw", tmp_b_prj, pinv2 @ out_w2)
+
+        a = F.silu(self.bn1(a))
+        b = F.silu(self.bn2(b))
+        out_a = a.to(dtype)
+        out_b = b.to(dtype)
+
+        return out_a, out_b
+
+
+class SpatialCrossAttn(nn.Module):
+    def __init__(self, c1: int, k: int = 3):
+        super().__init__()
+        p = autopad(k, None, 1)
+
+        self.swsp1 = SWSP(c1)
+        self.swsp2 = SWSP(c1)
+
+        self.sconv1 = nn.Sequential(
+            nn.Conv2d(1, c1, kernel_size=k, padding=p, bias=False),
+            nn.InstanceNorm2d(c1),
+            nn.SiLU()
+        )
+        self.sconv2 = nn.Sequential(
+            nn.Conv2d(1, c1, kernel_size=k, padding=p, bias=False),
+            nn.InstanceNorm2d(c1),
+            nn.SiLU()
+        )
+
+        self.conv1 = nn.Conv2d(c1, c1, kernel_size=k, padding=p, bias=False)
+        self.bn1 = nn.BatchNorm2d(c1)
+        self.conv2 = nn.Conv2d(c1, c1, kernel_size=k, padding=p, bias=False)
+        self.bn2 = nn.BatchNorm2d(c1)
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        a, b = x
+        assert a.shape == b.shape, "Input tensors must have the same shape"
+        s_a = self.swsp1(a)
+        s_b = self.swsp2(b)
+        s_a = self.sconv1(s_a)
+        s_b = self.sconv2(s_b)
+
+        ab = F.silu(self.bn1(self.conv1(a - s_a) + self.conv2(s_b)))
+        ba = F.silu(self.bn2(self.conv2(b - s_b) + self.conv1(s_a)))
+
+        out_a = a + ab
+        out_b = b + ba
+
+        return out_a, out_b

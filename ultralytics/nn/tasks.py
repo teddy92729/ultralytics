@@ -71,6 +71,11 @@ from ultralytics.nn.modules import (
     Slice,
     Add,
     Select,
+    DRAF,
+    AFEA,
+    SCMF,
+    DecoupledAttn,
+    SpatialCrossAttn,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1655,7 +1660,16 @@ def parse_model(d, ch, verbose=True):
                 args.append(ch[f])
             c2 = args[1] - args[0]
         elif m is Select:
-            c2 = ch[f[args[0]]]
+            c2 = ch[f]
+        elif m in [DRAF, AFEA]:
+            c2 = ch[f]
+            args[0] = c2
+        elif m is SCMF:
+            c2 = ch[f[0]]
+            args[0] = c2
+        elif m in [DecoupledAttn, SpatialCrossAttn]:
+            c2 = ch[f[0]]
+            args[0] = c2
         else:
             c2 = ch[f]
 

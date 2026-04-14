@@ -62,6 +62,11 @@ from .block import (
     Slice,
     Add,
     Select,
+    DRAF,
+    AFEA,
+    SCMF,
+    SpatialCrossAttn,
+    DecoupledAttn,
 )
 from .conv import (
     CBAM,
