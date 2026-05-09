@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.ops import DeformConv2d
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
@@ -2294,63 +2295,105 @@ class SWSP(nn.Module):
         return x
 
 
-class DecoupledAttn(nn.Module):
-    def __init__(self, c1: int, k: int = 1):
+class TopkSpatialAttn(nn.Module):
+
+    def __init__(self, c1, reduction: int = 4):
         super().__init__()
 
-        self.k = k
-        self.k2c = k**2 * c1
-        self.unfold = nn.Unfold(kernel_size=k, padding=k // 2)
-        self.inner_dim = c1
+        self.c1 = c1
+        self.reduction = reduction
+        self.topk = max(c1 // reduction, 1)
 
-        self.inner_proj1 = nn.Parameter(torch.empty(self.k2c, self.inner_dim), requires_grad=True)
-        self.inner_proj2 = nn.Parameter(torch.empty(self.k2c, self.inner_dim), requires_grad=True)
-        self.out_proj1 = nn.Parameter(torch.empty(self.k2c, c1), requires_grad=True)
-        self.out_proj2 = nn.Parameter(torch.empty(self.k2c, c1), requires_grad=True)
-        torch.nn.init.kaiming_uniform_(self.inner_proj1, a=math.sqrt(5))
-        torch.nn.init.kaiming_uniform_(self.inner_proj2, a=math.sqrt(5))
-        torch.nn.init.kaiming_uniform_(self.out_proj1, a=math.sqrt(5))
-        torch.nn.init.kaiming_uniform_(self.out_proj2, a=math.sqrt(5))
+        g_k = 7
+        coords = torch.arange(g_k).float() - g_k // 2
+        g_x, g_y = torch.meshgrid(coords, coords, indexing="ij")
+        self.grid = nn.Buffer((g_x**2 + g_y**2).view(1, 1, g_k, g_k))
+        self.sigma = nn.Parameter(torch.empty(c1, 1, 1, 1), requires_grad=True)
+        torch.nn.init.uniform_(self.sigma, a=math.sqrt(2 / 5), b=math.sqrt(((g_k // 2) ** 2 * 2) / 5))
+
+        self.weight1 = nn.Parameter(torch.zeros(1, c1, 1, 1), requires_grad=True)
+        self.conv_w = nn.Conv2d(c1, c1, kernel_size=1, bias=False).weight
+        self.bn1 = nn.Sequential(nn.BatchNorm2d(self.topk), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x0 = x
+
+        x_mean = x.mean(dim=[2, 3], keepdim=True)
+        x_std = x.std(dim=[2, 3], keepdim=True)
+
+        thres = x_mean + x_std * 2
+        px = torch.where(x > thres, torch.ones_like(x), torch.zeros_like(x))
+        thres = x_mean - x_std * 2
+        nx = torch.where(x < thres, torch.ones_like(x), torch.zeros_like(x))
+
+        x1 = torch.where((x > x_mean).float().mean(dim=[2, 3], keepdim=True) > 0.5, nx, px)
+
+        kernel = torch.exp(-(self.grid).expand(self.c1, -1, -1, -1) / (2 * self.sigma**2))
+        kernel = kernel / kernel.sum(dim=[2, 3], keepdim=True)
+        x = F.conv2d(x1, kernel, padding=kernel.shape[2] // 2, groups=self.c1) * self.weight1
+        x = (x1 + x) * x0.detach()
+
+        conv_w = F.softmax(self.conv_w, dim=0)
+        x = F.conv2d(x, conv_w)
+        x = torch.topk(x, self.topk, dim=1).values
+        x = self.bn1(x).mean(dim=1, keepdim=True)
+
+        return x
+
+class FusionTopk(nn.Module):
+    def __init__(self, c1: int, offset_k: int = 1):
+        super().__init__()
+
+        self.offset_k = offset_k
+        if offset_k > 1:
+            self.offset_conv1 = nn.Conv2d(2, 18, kernel_size=offset_k, padding=offset_k // 2, bias=False)
+            self.offset_conv2 = nn.Conv2d(2, 18, kernel_size=offset_k, padding=offset_k // 2, bias=False)
+            self.conv1 = DeformConv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
+            self.conv2 = DeformConv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
+        else:
+            self.conv1 = nn.Conv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
+            self.conv2 = nn.Conv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
 
         self.bn1 = nn.BatchNorm2d(c1)
         self.bn2 = nn.BatchNorm2d(c1)
+        self.w1 = nn.Parameter(torch.ones(1, c1, 1, 1), requires_grad=True)
+        self.w2 = nn.Parameter(torch.ones(1, c1, 1, 1), requires_grad=True)
 
     def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
-        a0, b0 = x
+        a0, b0, qa, qb = x
         assert a0.shape == b0.shape, "Input tensors must have the same shape"
         B, C, H, W = a0.shape
-        dtype = a0.dtype
 
-        with torch.autocast(device_type=a0.device.type, enabled=False):
+        if self.offset_k > 1:
+            log_qa = -torch.log(qa + 2e-3)
+            log_qb = -torch.log(qb + 2e-3)
 
-            a = a0.float()
-            a = self.unfold(a).view(B, self.k2c, H, W)
-            b = b0.float()
-            b = self.unfold(b).view(B, self.k2c, H, W)
+            offset1 = self.offset_conv1(torch.cat([log_qa, log_qa + log_qb], dim=1))
+            offset2 = self.offset_conv2(torch.cat([log_qb, log_qa + log_qb], dim=1))
+            torch.nan_to_num_(offset1, nan=0.0)
+            torch.nan_to_num_(offset2, nan=0.0)
+            offset1 = torch.tanh(offset1) * self.offset_k
+            offset2 = torch.tanh(offset2) * self.offset_k
 
-            in_w1 = self.inner_proj1.float()
-            in_w2 = self.inner_proj2.float()
+            a, ka = self.conv1(a0, offset1).chunk(2, dim=1)
+            b, kb = self.conv2(b0, offset2).chunk(2, dim=1)
+        else:
+            a, ka = self.conv1(a0).chunk(2, dim=1)
+            b, kb = self.conv2(b0).chunk(2, dim=1)
+        ka_sqsuminv = 1 / ka.square().sum(dim=[2, 3], keepdim=True).add_(1e-6)
+        kb_sqsuminv = 1 / kb.square().sum(dim=[2, 3], keepdim=True).add_(1e-6)
 
-            pinv1 = torch.linalg.pinv(in_w1, rcond=1e-5)
-            pinv2 = torch.linalg.pinv(in_w2, rcond=1e-5)
-            out_w1 = self.out_proj1.float()
-            out_w2 = self.out_proj2.float()
+        ctx_a = (ka * qa).sum(dim=[2, 3], keepdim=True) * ka_sqsuminv
+        ctx_b = (kb * qa).sum(dim=[2, 3], keepdim=True) * kb_sqsuminv
+        a = a + ctx_a * ka + ctx_b * kb * self.w1
 
-            a_prj = torch.einsum("bchw,cd->bdhw", a, in_w1)
-            b_prj = torch.einsum("bchw,cd->bdhw", b, in_w2)
+        ctx_a = (ka * qb).sum(dim=[2, 3], keepdim=True) * ka_sqsuminv
+        ctx_b = (kb * qb).sum(dim=[2, 3], keepdim=True) * kb_sqsuminv
+        b = b + ctx_b * kb + ctx_a * ka * self.w2
 
-            similarity = torch.cosine_similarity(a_prj, b_prj, dim=1, eps=1e-8).unsqueeze(1)
-            tmp_a_prj = a_prj + b_prj * similarity
-            tmp_b_prj = b_prj + a_prj * similarity
-
-            a = torch.einsum("bdhw,dc->bchw", tmp_a_prj, pinv1 @ out_w1)
-            b = torch.einsum("bdhw,dc->bchw", tmp_b_prj, pinv2 @ out_w2)
-
-        a = F.silu(self.bn1(a))
-        b = F.silu(self.bn2(b))
-        out_a = a.to(dtype)
-        out_b = b.to(dtype)
-
+        out_a = F.silu(self.bn1(a))
+        out_b = F.silu(self.bn2(b))
         return out_a, out_b
 
 
@@ -2393,3 +2436,240 @@ class SpatialCrossAttn(nn.Module):
         out_b = b + ba
 
         return out_a, out_b
+
+
+class DepthwiseSeparableConv(nn.Module):
+    """深度可分離卷積，用於減少計算量 [3, 4]"""
+
+    def __init__(self, in_ch, out_ch, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size, stride, padding, groups=in_ch)
+        self.pointwise = nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x):
+        return self.pointwise(self.depthwise(x))
+
+
+# --- SAM 模組相關組件 ---
+
+
+class LIPU(nn.Module):
+    """局部資訊感知單元 (Local Information Perception Unit) [5]"""
+
+    def __init__(self, channels):
+        super().__init__()
+        assert channels % 4 == 0, "Channels must be divisible by 4"
+        self.K = 4
+        self.ch_per_group = channels // 4
+        # 多尺度深度卷積 (MS-DWC) 核大小: 3, 5, 7, 9 [6]
+        self.ms_dwc = nn.ModuleList(
+            [nn.Conv1d(self.ch_per_group, self.ch_per_group, k, padding=k // 2, groups=self.ch_per_group) for k in [3, 5, 7, 9]]
+        )
+        self.gn = nn.GroupNorm(4, channels)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        # 空間分解為 H 與 W 兩個單向特徵 [5]
+        x_h = x.mean(dim=-1)  # B, C, H
+        x_w = x.mean(dim=-2)  # B, C, W
+
+        def process_dim(feat):
+            groups = torch.chunk(feat, self.K, dim=1)
+            out = [self.ms_dwc[i](groups[i]) for i in range(self.K)]
+
+            return self.sigmoid(self.gn(torch.cat(out, dim=1)))
+
+        attn_h = process_dim(x_h).unsqueeze(-1)  # B, C, H, 1
+        attn_w = process_dim(x_w).unsqueeze(-2)  # B, C, 1, W
+
+        # 廣播乘法調整原始特徵圖 [10]
+        return x * attn_h * attn_w
+
+
+class SparseMultiheadAttention(nn.Module):
+    """改進的稀疏 Transformer 注意力機制 [11, 12]"""
+
+    def __init__(self, embed_dim, num_heads=8, reduction_factor=2):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.qkv = nn.Linear(embed_dim, embed_dim * 3)
+        self.wo = nn.Linear(embed_dim, embed_dim)
+
+        # 降低 K, V 的計算複雜度 [4]
+        self.reduction = nn.Conv1d(self.head_dim, self.head_dim, kernel_size=reduction_factor, stride=reduction_factor, groups=self.head_dim)
+        self.ln = nn.LayerNorm(self.head_dim)
+        # 可學習的超參數 alpha，用於控制稀疏比例 [12]
+        self.theta = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3 * self.num_heads, self.head_dim).permute(0, 2, 1, 3).contiguous()
+        q, k, v = torch.chunk(qkv, 3, dim=1)  # 每個形狀為 (B, num_heads, N, head_dim)
+
+        q = q.reshape(B * self.num_heads, N, self.head_dim)
+        k = k.reshape(B * self.num_heads, N, self.head_dim)
+        v = v.reshape(B * self.num_heads, N, self.head_dim)
+        # 降維 K, V
+        k = self.ln(self.reduction(k.transpose(-1, -2)).transpose(-1, -2))
+        v = self.ln(self.reduction(v.transpose(-1, -2)).transpose(-1, -2))
+
+        # 計算注意力分數 [11]
+        # attn = (q @ k.transpose(-2, -1)) / (self.head_dim**0.5)
+        attn = torch.einsum("bnc,blc->bnl", q, k) / (self.head_dim**0.5)
+
+        # 稀疏化處理：保留 Top-alpha% 的元素 [11, 12]
+        alpha = torch.sigmoid(self.theta)
+        k_size = attn.size(-1)
+        top_k = max(1, int(k_size * alpha.item()))
+
+        values, indices = torch.topk(attn, top_k, dim=-1)
+        sparse_attn = torch.full_like(attn, float("-inf"))
+        sparse_attn.scatter_(-1, indices, values)
+
+        attn = F.softmax(sparse_attn, dim=-1)
+
+        out = torch.einsum("bnl,blc->bnc", attn, v).view(B, self.num_heads, N, self.head_dim)
+        # 合併多頭輸出
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, N, C)
+
+        return self.wo(out)
+
+
+class SAM(nn.Module):
+    """稀疏注意模組 (Sparse Attention Module) [11, 14]"""
+
+    def __init__(self, channels, h_low=20, w_low=20):
+        super().__init__()
+        self.lipu = LIPU(channels)
+        self.aap = nn.AdaptiveAvgPool2d((h_low, w_low))  # 降維減少計算量 [15]
+
+        # 局部特徵聚合 [15]
+        self.local_aggr = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels),
+            nn.Conv2d(channels, channels, (1, 5), padding=(0, 2), groups=channels),
+            nn.Conv2d(channels, channels, (5, 1), padding=(2, 0), groups=channels),
+        )
+
+        self.transformer = SparseMultiheadAttention(channels)
+        self.ln = nn.LayerNorm(channels)
+        self.mlp = nn.Sequential(nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels))
+
+    def forward(self, x_rgb, x_t):
+        # 1. 局部資訊感知
+        x_rgb = self.lipu(x_rgb)
+        x_t = self.lipu(x_t)
+
+        # 2. 降維與特徵聚合
+        x_rgb_low = self.aap(x_rgb)
+        x_t_low = self.aap(x_t)
+        x_rgb_low = x_rgb_low + self.local_aggr(x_rgb_low)
+        x_t_low = x_t_low + self.local_aggr(x_t_low)
+
+        # 3. Transformer 全域資訊提取 [3]
+        B, C, H, W = x_rgb_low.shape
+        tokens = torch.cat([x_rgb_low.flatten(2), x_t_low.flatten(2)], dim=2).transpose(1, 2)  # (B, 2*H*W, C)
+
+        f = self.transformer(tokens)
+        f = f + tokens
+        f = f + self.mlp(self.ln(f))
+
+        # 4. 還原回雙路特徵圖 [16, 17]
+        res_rgb, res_t = torch.split(f, H * W, dim=1)
+        res_rgb = res_rgb.transpose(1, 2).reshape(B, C, H, W)
+        res_t = res_t.transpose(1, 2).reshape(B, C, H, W)
+
+        return res_rgb, res_t
+
+
+# --- EAM 模組相關組件 ---
+
+
+class SCA(nn.Module):
+    """移位通道注意力 (Shift Channel Attention) [18]"""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(channels, channels // 4), nn.ReLU(), nn.Linear(channels // 4, channels))
+
+    def forward(self, x):
+        avg_out = self.mlp(F.adaptive_avg_pool2d(x, 1).view(x.size(0), -1))
+        max_out = self.mlp(F.adaptive_max_pool2d(x, 1).view(x.size(0), -1))
+        # 將權限縮放到 [-1, 1] 範圍 [18]
+        return 2 * torch.sigmoid(avg_out + max_out) - 1
+
+
+class EAM(nn.Module):
+    """顯式注意模組 (Explicit Attention Module) [17, 19]"""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.sca_rgb = SCA(channels)
+        self.sca_t = SCA(channels)
+
+        # 空間與全域資訊聚合
+        self.dwc = nn.Conv2d(channels * 2, channels * 2, 3, padding=1, groups=channels * 2)
+        self.ca = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(channels * 2, channels * 2, 1), nn.Sigmoid())
+        self.ffs = nn.Conv2d(channels * 2, channels, 1)  # 特徵融合壓縮 (FFS) [19]
+
+    def forward(self, x_rgb, x_t):
+        r = self.sca_rgb(x_rgb).view(x_rgb.size(0), -1, 1, 1)
+        t = self.sca_t(x_t).view(x_t.size(0), -1, 1, 1)
+
+        # 處理模態衝突的顯式注意力邏輯 [20]
+        # 路徑 1: 增強激活
+        xp1_rgb = x_rgb * (r + r * t)
+        xp1_t = x_t * (t + r * t)
+        xp1 = torch.cat([xp1_rgb, xp1_t], dim=1)
+
+        # 路徑 2: 衝突感知激活 (確保衝突時至少一分支活耀) [20]
+        xp2_mask = 1 - r * t
+        xp2 = torch.cat([x_rgb * xp2_mask, x_t * xp2_mask], dim=1)
+
+        # 特徵增強
+        feat1 = self.ca(self.dwc(xp1)) * xp1
+        feat2 = self.ca(self.dwc(xp2)) * xp2
+
+        fused = self.ffs(feat1 + feat2)
+
+        # 殘差連接注入補充資訊 [21]
+        return x_rgb + fused, x_t + fused
+
+
+# --- EUB 模組 ---
+
+
+class EUB(nn.Module):
+    """高效上採樣區塊 (Efficient Upsampling Block) [38, Fig 6]"""
+
+    def __init__(self, channels):
+        super().__init__()
+        self.group_conv = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
+        self.bn = nn.BatchNorm2d(channels)
+        self.relu = nn.ReLU()
+        self.pw_conv = nn.Conv2d(channels, channels, 1)  # 加強通道間通訊 [21]
+
+    def forward(self, x, size):
+        x = F.interpolate(x, size=size, mode="nearest")
+        x = self.relu(self.bn(self.group_conv(x)))
+        return self.pw_conv(x)
+
+
+# --- Steam 融合模組 (SAM + EAM) ---
+
+
+class SteamModule(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.sam = SAM(channels)
+        self.eam = EAM(channels)
+        self.eub = EUB(channels)
+
+    def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
+        x_rgb, x_t = x
+        assert x_rgb.shape == x_t.shape, "Input tensors must have the same shape"
+        B, C, H, W = x_rgb.shape
+        x_rgb, x_t = self.sam(x_rgb, x_t)
+        x_rgb, x_t = self.eam(x_rgb, x_t)
+        return self.eub(x_rgb, (H, W)), self.eub(x_t, (H, W))

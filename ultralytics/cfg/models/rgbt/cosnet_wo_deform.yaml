@@ -36,7 +36,7 @@ backbone:
   # Fusion
   - [6, 1, TopkSpatialAttn, [256]] # 13
   - [12, 1, TopkSpatialAttn, [256]] # 14
-  - [[6, 12, -2, -1], 1, FusionTopk, [256, 5]] # 15-P3
+  - [[6, 12, -2, -1], 1, FusionTopk, [256]] # 15-P3
   - [-1, 1, Select, [0]] # 16
   - [-2, 1, Select, [1]] # 17
 

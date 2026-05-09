@@ -66,7 +66,9 @@ from .block import (
     AFEA,
     SCMF,
     SpatialCrossAttn,
-    DecoupledAttn,
+    FusionTopk,
+    TopkSpatialAttn,
+    SteamModule,
 )
 from .conv import (
     CBAM,
