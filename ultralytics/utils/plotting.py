@@ -1032,9 +1032,14 @@ def feature_visualization(x, module_type: str, stage: int, n: int = 32, save_dir
 
             blocks = torch.chunk(x[0].cpu(), channels, dim=0)  # select batch index 0, block by channels
             n = min(n, channels)  # number of plots
-            _, ax = plt.subplots(math.ceil(n / 8), 8, tight_layout=True)  # 8 rows x n/8 cols
-            ax = ax.ravel()
             plt.subplots_adjust(wspace=0.05, hspace=0.05)
+            if n < 8:
+                _, ax = plt.subplots(1, n, tight_layout=True)
+                if n == 1:
+                    ax = [ax]  # make it iterable
+            else:
+                _, ax = plt.subplots(math.ceil(n / 8), 8, tight_layout=True)  # 8 rows x n/8 cols
+                ax = ax.ravel()
             for i in range(n):
                 ax[i].imshow(blocks[i].squeeze())  # cmap='gray'
                 ax[i].axis("off")
