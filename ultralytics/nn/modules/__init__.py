@@ -69,6 +69,8 @@ from .block import (
     FusionTopk,
     TopkSpatialAttn,
     SteamModule,
+    RegNet_lite,
+    AEFM,
 )
 from .conv import (
     CBAM,

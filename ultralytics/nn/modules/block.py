@@ -2297,49 +2297,44 @@ class SWSP(nn.Module):
 
 class TopkSpatialAttn(nn.Module):
 
-    def __init__(self, c1, reduction: int = 4):
+    def __init__(self, c1, k=3, inner_size=20):
         super().__init__()
 
         self.c1 = c1
-        self.reduction = reduction
-        self.topk = max(c1 // reduction, 1)
+        self.k = k
+        self.isize = inner_size
 
-        g_k = 7
-        coords = torch.arange(g_k).float() - g_k // 2
-        g_x, g_y = torch.meshgrid(coords, coords, indexing="ij")
-        self.grid = nn.Buffer((g_x**2 + g_y**2).view(1, 1, g_k, g_k))
-        self.sigma = nn.Parameter(torch.empty(c1, 1, 1, 1), requires_grad=True)
-        torch.nn.init.uniform_(self.sigma, a=math.sqrt(2 / 5), b=math.sqrt(((g_k // 2) ** 2 * 2) / 5))
+        self.conv_proj = nn.Conv2d(c1, c1 * 3, kernel_size=1)
+        self.prj_w = nn.Parameter(torch.empty(inner_size**2, k**2), requires_grad=True)
+        torch.nn.init.kaiming_uniform_(self.prj_w, a=math.sqrt(5))
 
-        self.weight1 = nn.Parameter(torch.zeros(1, c1, 1, 1), requires_grad=True)
-        self.conv_w = nn.Conv2d(c1, c1, kernel_size=1, bias=False).weight
-        self.bn1 = nn.Sequential(nn.BatchNorm2d(self.topk), nn.Sigmoid())
+        self.unfold = nn.Unfold(kernel_size=k, padding=k // 2)
+        self.insn = nn.InstanceNorm2d(c1)
+        self.threshold = nn.Parameter(torch.ones(1, 1, 1, 1), requires_grad=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         x0 = x
 
-        x_mean = x.mean(dim=[2, 3], keepdim=True)
-        x_std = x.std(dim=[2, 3], keepdim=True)
+        q, k, v = self.conv_proj(x).chunk(3, dim=1)
 
-        thres = x_mean + x_std * 2
-        px = torch.where(x > thres, torch.ones_like(x), torch.zeros_like(x))
-        thres = x_mean - x_std * 2
-        nx = torch.where(x < thres, torch.ones_like(x), torch.zeros_like(x))
+        q = F.interpolate(F.silu(self.insn(q)), [self.isize] * 2, mode="area").flatten(2)
+        k = k.flatten(2)
+        v = v.flatten(2)
 
-        x1 = torch.where((x > x_mean).float().mean(dim=[2, 3], keepdim=True) > 0.5, nx, px)
+        q = torch.einsum("bcl,lk->bck", q, self.prj_w)
+        ctx = torch.einsum("bck,bcl->bkl", q, k) / math.sqrt(C)
+        ctx = F.softmax(ctx, dim=-1)
+        attn = torch.einsum("bkl,bcl->bck", ctx, v)
+        attn = F.softmax(attn, dim=1).view(B, -1)
 
-        kernel = torch.exp(-(self.grid).expand(self.c1, -1, -1, -1) / (2 * self.sigma**2))
-        kernel = kernel / kernel.sum(dim=[2, 3], keepdim=True)
-        x = F.conv2d(x1, kernel, padding=kernel.shape[2] // 2, groups=self.c1) * self.weight1
-        x = (x1 + x) * x0.detach()
-
-        conv_w = F.softmax(self.conv_w, dim=0)
-        x = F.conv2d(x, conv_w)
-        x = torch.topk(x, self.topk, dim=1).values
-        x = self.bn1(x).mean(dim=1, keepdim=True)
+        x = self.unfold(x0).view(B, -1, H, W)
+        x = torch.einsum("bc,bchw->bhw", attn, x).view(B, 1, H, W)
+        x = F.instance_norm(x)
+        x = F.sigmoid(x * 5 / 3 - F.silu(self.threshold))
 
         return x
+
 
 class FusionTopk(nn.Module):
     def __init__(self, c1: int, offset_k: int = 1):
@@ -2347,18 +2342,30 @@ class FusionTopk(nn.Module):
 
         self.offset_k = offset_k
         if offset_k > 1:
-            self.offset_conv1 = nn.Conv2d(2, 18, kernel_size=offset_k, padding=offset_k // 2, bias=False)
-            self.offset_conv2 = nn.Conv2d(2, 18, kernel_size=offset_k, padding=offset_k // 2, bias=False)
-            self.conv1 = DeformConv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
-            self.conv2 = DeformConv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
+            self.localk = 3
+            self.unfold_local = nn.Unfold(kernel_size=self.localk, padding=self.localk // 2)
+            self.unfold_offset = nn.Unfold(kernel_size=offset_k, padding=offset_k // 2)
+
+            self.offset_map = nn.Parameter(torch.empty(self.offset_k**2, 18), requires_grad=True)
+            torch.nn.init.uniform(self.offset_map, -5, 5)
+
+            self.ln1 = nn.LayerNorm(self.offset_k**2)
+            self.ln2 = nn.LayerNorm(self.offset_k**2)
+
+            self.conv1 = DeformConv2d(c1, c1, kernel_size=3, padding=1, bias=False)
+            self.conv2 = DeformConv2d(c1, c1, kernel_size=3, padding=1, bias=False)
         else:
-            self.conv1 = nn.Conv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
-            self.conv2 = nn.Conv2d(c1, 2 * c1, kernel_size=3, padding=1, bias=False)
+            self.conv1 = nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False)
+            self.conv2 = nn.Conv2d(c1, c1, kernel_size=3, padding=1, bias=False)
+
+        self.ln3 = nn.LayerNorm(c1)
+        self.ln4 = nn.LayerNorm(c1)
 
         self.bn1 = nn.BatchNorm2d(c1)
         self.bn2 = nn.BatchNorm2d(c1)
         self.w1 = nn.Parameter(torch.ones(1, c1, 1, 1), requires_grad=True)
         self.w2 = nn.Parameter(torch.ones(1, c1, 1, 1), requires_grad=True)
+        self.z = nn.Buffer(torch.zeros(1))
 
     def forward(self, x: list[torch.Tensor]) -> list[torch.Tensor]:
         a0, b0, qa, qb = x
@@ -2366,31 +2373,57 @@ class FusionTopk(nn.Module):
         B, C, H, W = a0.shape
 
         if self.offset_k > 1:
-            log_qa = -torch.log(qa + 2e-3)
-            log_qb = -torch.log(qb + 2e-3)
+            log_qa = - torch.log(1 - qa + 2e-3)
+            log_qa = log_qa - log_qa.mean(dim=[2, 3], keepdim=True)
+            log_qa = self.unfold_local(log_qa).view(B, self.localk**2, H, W)
 
-            offset1 = self.offset_conv1(torch.cat([log_qa, log_qa + log_qb], dim=1))
-            offset2 = self.offset_conv2(torch.cat([log_qb, log_qa + log_qb], dim=1))
+            log_qb = - torch.log(1 - qb + 2e-3)
+            log_qb = log_qb - log_qb.mean(dim=[2, 3], keepdim=True)
+            log_qb = self.unfold_local(log_qb).view(B, self.localk**2, H, W)
+
+            z = self.z.view(1, 1, 1, 1).expand(B, H, W, 1)
+
+            offset_lqa = self.unfold_offset(log_qa).view(B, self.localk**2, self.offset_k**2, H, W)
+            offset_lqb = self.unfold_offset(log_qb).view(B, self.localk**2, self.offset_k**2, H, W)
+            offset_ctx_a = torch.einsum("bchw,bcjhw->bhwj", log_qa, offset_lqb)
+            offset_ctx_a = self.ln1(offset_ctx_a)
+            offset_ctx_a = torch.cat([offset_ctx_a, z], dim=-1).softmax(dim=-1)[:, :, :, :-1]
+            offset1 = torch.einsum("bhwi,ij->bjhw", offset_ctx_a, self.offset_map)
+            offset1 = torch.tanh(offset1) * (self.offset_k // 2)
+
+            offset_ctx_b = torch.einsum("bchw,bcjhw->bhwj", log_qb, offset_lqa)
+            offset_ctx_b = self.ln2(offset_ctx_b)
+            offset_ctx_b = torch.cat([offset_ctx_b, z], dim=-1).softmax(dim=-1)[:, :, :, :-1]
+            offset2 = torch.einsum("bhwi,ij->bjhw", offset_ctx_b, self.offset_map)
+            offset2 = torch.tanh(offset2) * (self.offset_k // 2)
+
+            # print(offset1.abs().max(), offset1.abs().mean(), offset2.abs().max(), offset2.abs().mean())
+            # print(self.offset_map.abs().max(), self.offset_map.abs().mean())
             torch.nan_to_num_(offset1, nan=0.0)
             torch.nan_to_num_(offset2, nan=0.0)
-            offset1 = torch.tanh(offset1) * self.offset_k
-            offset2 = torch.tanh(offset2) * self.offset_k
 
-            a, ka = self.conv1(a0, offset1).chunk(2, dim=1)
-            b, kb = self.conv2(b0, offset2).chunk(2, dim=1)
+            a = self.conv1(a0, offset1)
+            b = self.conv2(b0, offset2)
         else:
-            a, ka = self.conv1(a0).chunk(2, dim=1)
-            b, kb = self.conv2(b0).chunk(2, dim=1)
-        ka_sqsuminv = 1 / ka.square().sum(dim=[2, 3], keepdim=True).add_(1e-6)
-        kb_sqsuminv = 1 / kb.square().sum(dim=[2, 3], keepdim=True).add_(1e-6)
+            a = self.conv1(a0)
+            b = self.conv2(b0)
 
-        ctx_a = (ka * qa).sum(dim=[2, 3], keepdim=True) * ka_sqsuminv
-        ctx_b = (kb * qa).sum(dim=[2, 3], keepdim=True) * kb_sqsuminv
-        a = a + ctx_a * ka + ctx_b * kb * self.w1
+        a2a = (a * qa).mean(dim=[2, 3])
+        a2a = self.ln3(a2a)
+        a2a = F.tanh(a2a).view(B, C, 1, 1)
+        b2b = (b * qb).mean(dim=[2, 3])
+        b2b = self.ln3(b2b)
+        b2b = F.tanh(b2b).view(B, C, 1, 1)
 
-        ctx_a = (ka * qb).sum(dim=[2, 3], keepdim=True) * ka_sqsuminv
-        ctx_b = (kb * qb).sum(dim=[2, 3], keepdim=True) * kb_sqsuminv
-        b = b + ctx_b * kb + ctx_a * ka * self.w2
+        a2b = (a * qa).mean(dim=[2, 3])
+        a2b = self.ln4(a2b)
+        a2b = F.tanh(a2b).view(B, C, 1, 1)
+        b2a = (b * qb).mean(dim=[2, 3])
+        b2a = self.ln4(b2a)
+        b2a = F.tanh(b2a).view(B, C, 1, 1)
+
+        a = a + b * b2a * a2a
+        b = b + a * a2b * b2b
 
         out_a = F.silu(self.bn1(a))
         out_b = F.silu(self.bn2(b))
@@ -2673,3 +2706,316 @@ class SteamModule(nn.Module):
         x_rgb, x_t = self.sam(x_rgb, x_t)
         x_rgb, x_t = self.eam(x_rgb, x_t)
         return self.eub(x_rgb, (H, W)), self.eub(x_t, (H, W))
+
+class h_swish(nn.Module):
+    def forward(self, x):
+        return x * F.relu6(x + 3) / 6
+
+
+class CoordAtt(nn.Module):
+    def __init__(self, inp, oup, reduction=2):
+        super(CoordAtt, self).__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)
+
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = h_swish()
+
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+
+        n, c, h, w = x.size()
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)
+
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        out = identity * a_w * a_h
+
+        return out
+
+class AP_MP(nn.Module):
+    def __init__(self, stride=2):
+        super(AP_MP, self).__init__()
+        self.sz = stride
+        self.gapLayer = nn.AvgPool2d(kernel_size=self.sz, stride=self.sz)
+        self.gmpLayer = nn.MaxPool2d(kernel_size=self.sz, stride=self.sz)
+
+    def forward(self, x):
+        apimg = self.gapLayer(x)
+        mpimg = self.gmpLayer(x)
+        byimg = torch.norm(abs(apimg - mpimg), p=2, dim=1, keepdim=True)
+        return byimg
+
+class AEFM(nn.Module):
+    def __init__(self, channel):
+        super(AEFM, self).__init__()
+        self.convTo2 = nn.Conv2d(channel * 2, 2, 3, 1, 1)
+        self.sigmoid = nn.Sigmoid()
+        self.coordAttention = CoordAtt(channel, channel)
+        self.channel = channel
+
+        self.glbamp = AP_MP(stride=2)
+        self.conv_cat = nn.Sequential(
+            nn.Conv2d(channel * 2 + 1, channel, 1),
+            nn.BatchNorm2d(channel, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
+            nn.ReLU(True),
+        )
+
+    def forward(self, x):
+        r, d = x
+        H = torch.cat(x, dim=1)
+        H_conv = self.sigmoid(self.convTo2(H))
+
+        ga, gm = H_conv.chunk(2, dim=1)
+
+        Ga = r * ga
+        Gm = d * gm
+
+        Gm_out = self.coordAttention(Gm)
+        Ga_out = self.coordAttention(Ga)
+
+        res = Gm_out + Ga_out
+
+        gamp = F.interpolate(self.glbamp(res), size=res.shape[2:], mode='bilinear', align_corners=True)
+        gamp = gamp / math.sqrt(self.channel)
+
+        cat = torch.cat((Ga_out, Gm_out, gamp), dim=1)
+        cat = self.conv_cat(cat)
+        sal = res + cat
+
+        return sal
+
+
+class Warp2D:
+    def __init__(self, padding=False):
+        self.padding = padding
+
+    def __call__(self, I, flow):
+        return self._transform(I, flow[:, 0, :, :], flow[:, 1, :, :])
+
+    def _meshgrid(self, height, width):
+        x_t = torch.matmul(torch.ones(height, 1), torch.linspace(0.0, float(width) - 1.0, width).unsqueeze(0))
+
+        y_t = torch.matmul(torch.linspace(0.0, float(height) - 1.0, height).unsqueeze(1), torch.ones(1, width))
+
+        return x_t, y_t
+
+    def _transform(self, I, dx, dy):
+        device = I.device
+        dtype = I.dtype
+        batch_size = dx.shape[0]
+        height = dx.shape[1]
+        width = dx.shape[2]
+
+        # Convert dx and dy to absolute locations
+        x_mesh, y_mesh = self._meshgrid(height, width)
+        x_mesh = x_mesh.unsqueeze(0).repeat(batch_size, 1, 1).to(device=device, dtype=dtype)
+        y_mesh = y_mesh.unsqueeze(0).repeat(batch_size, 1, 1).to(device=device, dtype=dtype)
+        x_new = dx + x_mesh
+        y_new = dy + y_mesh
+
+        return self._interpolate(I, x_new, y_new)
+
+    def _repeat(self, x, n_repeats):
+        rep = torch.ones(n_repeats, dtype=torch.int)
+        x = torch.matmul(x.view([-1, 1]).int(), rep.unsqueeze(0))
+        return x.view([-1])
+
+    def _interpolate(self, im, x, y):
+        device = im.device
+        orig_dtype = im.dtype
+        if self.padding:
+            im = F.pad(im, (1, 1, 1, 1))
+
+        num_batch = im.shape[0]
+        channels = im.shape[1]
+        height = im.shape[2]
+        width = im.shape[3]
+
+        out_height = x.shape[1]
+        out_width = x.shape[2]
+
+        x = x.view([-1])
+        y = y.view([-1])
+
+        padding_constant = 1 if self.padding else 0
+        x = x.float() + padding_constant
+        y = y.float() + padding_constant
+
+        max_x = int(width - 1)
+        max_y = int(height - 1)
+
+        x0 = torch.floor(x).int()
+        x1 = x0 + 1
+        y0 = torch.floor(y).int()
+        y1 = y0 + 1
+
+        x0 = torch.clamp(x0, 0, max_x)
+        x1 = torch.clamp(x1, 0, max_x)
+        y0 = torch.clamp(y0, 0, max_y)
+        y1 = torch.clamp(y1, 0, max_y)
+
+        dim1 = width
+
+        base = self._repeat(torch.arange(num_batch) * dim1 * height, out_height * out_width).to(device)
+
+        idx_a = (base + x0 + y0 * dim1)[:, None].repeat(1, channels)
+        idx_b = (base + x0 + y1 * dim1)[:, None].repeat(1, channels)
+        idx_c = (base + x1 + y0 * dim1)[:, None].repeat(1, channels)
+        idx_d = (base + x1 + y1 * dim1)[:, None].repeat(1, channels)
+
+        # use indices to lookup pixels in the flat image and restore
+        # channels dim
+        im_flat = im.permute(0, 2, 3, 1).contiguous().view([-1, channels]).float()
+
+        Ia = torch.gather(im_flat, 0, idx_a.long())
+        Ib = torch.gather(im_flat, 0, idx_b.long())
+        Ic = torch.gather(im_flat, 0, idx_c.long())
+        Id = torch.gather(im_flat, 0, idx_d.long())
+
+        # and finally calculate interpolated values
+        x1_f = x1.float()
+        y1_f = y1.float()
+
+        dx = x1_f - x
+        dy = y1_f - y
+
+        wa = (dx * dy)[:, None]
+        wb = (dx * (1 - dy))[:, None]
+        wc = ((1 - dx) * dy)[:, None]
+        wd = ((1 - dx) * (1 - dy))[:, None]
+
+        output = wa * Ia + wb * Ib + wc * Ic + wd * Id
+        output = output.view([-1, out_height, out_width, channels])
+
+        return output.permute(0, 3, 1, 2).to(dtype=orig_dtype)
+
+def positionalencoding2d(d_model, height, width):
+    """
+    :param d_model: dimension of the model
+    :param height: height of the positions
+    :param width: width of the positions
+    :return: d_model*height*width position matrix
+    """
+    if d_model % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with "
+                         "odd dimension (got dim={:d})".format(d_model))
+    pe = torch.zeros(d_model, height, width)
+    # Each dimension use half of d_model
+    d_model = int(d_model / 2)
+    div_term = torch.exp(torch.arange(0., d_model, 2) *
+                         -(math.log(10000.0) / d_model))
+    pos_w = torch.arange(0., width).unsqueeze(1)
+    pos_h = torch.arange(0., height).unsqueeze(1)
+    pe[0:d_model:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[1:d_model:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[d_model::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+    pe[d_model + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+
+    return pe
+
+class RegBlk_lite(nn.Module):
+    def __init__(self, in_channel):
+        super(RegBlk_lite, self).__init__()
+
+        self.in_channel = in_channel
+
+        self.conv1x1 = nn.Sequential(
+            nn.Conv2d(kernel_size=1, stride=1, padding=0, in_channels=in_channel * 2, out_channels=in_channel), nn.LeakyReLU()
+        )
+
+        self.crossAtt_prj = nn.Conv2d(in_channel, in_channel * 2, kernel_size=1, stride=1, padding=0)
+        self.mlp = nn.Sequential(
+            nn.Conv2d(in_channel, in_channel // 4, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(),
+            nn.Conv2d(in_channel // 4, in_channel, kernel_size=1, stride=1, padding=0),
+            nn.ReLU(),
+        )
+
+        self.feature_output = nn.Sequential(
+            nn.Conv2d(in_channels=in_channel, out_channels=in_channel, kernel_size=3, padding=1, stride=1),
+            nn.ReLU(),
+        )
+
+        self.flow_output = nn.Sequential(
+            nn.Conv2d(in_channels=in_channel, out_channels=2, kernel_size=3, padding=1, stride=1),
+            nn.Tanh(),
+        )
+
+    def forward(self, d, f_cat):
+        f_cat = self.conv1x1(f_cat)
+
+        f_cat_kv = self.crossAtt_prj(
+            f_cat + positionalencoding2d(self.in_channel, f_cat.shape[2], f_cat.shape[3]).to(device=f_cat.device, dtype=f_cat.dtype)
+        )
+        d_p = d + positionalencoding2d(self.in_channel, d.shape[2], d.shape[3]).to(device=d.device, dtype=d.dtype)
+
+        q = d_p.flatten(2)
+        k, v = f_cat_kv.flatten(2).chunk(2, dim=1)
+
+        ctx = torch.einsum("bcl,bcn->bln", q, k) / math.sqrt(self.in_channel)
+        ctx = F.softmax(ctx, dim=-1)
+        f_cat = torch.einsum("bln,bcn->bcl", ctx, v).view_as(d)
+        f_cat = self.mlp(f_cat)
+
+        f_out = self.feature_output(f_cat) + f_cat
+        flow = self.flow_output(f_out)
+        return f_out, flow
+
+
+class RegNet_lite(nn.Module):
+    def __init__(self, in_channel):
+        super(RegNet_lite, self).__init__()
+
+        self.n = 3
+
+        self.regblkl = nn.ModuleList([RegBlk_lite(in_channel) for _ in range(self.n)])
+        self.regblkr = nn.ModuleList([RegBlk_lite(in_channel) for _ in range(self.n)])
+        self.warp = Warp2D(padding=True)
+
+    def forward(self, x):
+        a0, b0 = x
+        assert a0.shape == b0.shape, "Input tensors must have the same shape"
+        B, C, H, W = a0.shape
+
+        a = a0
+        b = b0
+        d_a = a0
+        d_b = b0
+        flow_as = torch.zeros(B, 2, H, W).to(device=a0.device, dtype=a0.dtype)
+        flow_bs = torch.zeros(B, 2, H, W).to(device=a0.device, dtype=a0.dtype)
+
+        for i in range(self.n):
+            f_cat = torch.cat((a, b), dim=1)
+            scale = 2**(i - self.n + 1)
+            f_cat = F.adaptive_avg_pool2d(f_cat, (int(H * scale), int(W * scale)))
+            d_a, flow_a = self.regblkl[i](d=d_a, f_cat=f_cat)
+            d_b, flow_b = self.regblkr[i](d=d_b, f_cat=f_cat)
+            flow_as = flow_as + flow_a
+            flow_bs = flow_bs + flow_b
+
+            if (i + 1) < self.n:
+                a = self.warp(a, flow_a)
+                b = self.warp(b, flow_b)
+
+        flow_diff = flow_as - flow_bs
+
+        warp_b = self.warp(b0, flow_diff)
+
+        return a0, warp_b

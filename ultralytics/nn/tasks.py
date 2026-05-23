@@ -78,6 +78,8 @@ from ultralytics.nn.modules import (
     TopkSpatialAttn,
     SpatialCrossAttn,
     SteamModule,
+    RegNet_lite,
+    AEFM,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1673,6 +1675,9 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f[0]]
             args[0] = c2
         elif m in [FusionTopk, SpatialCrossAttn, SteamModule]:
+            c2 = ch[f[0]]
+            args[0] = c2
+        elif m in [RegNet_lite, AEFM]:
             c2 = ch[f[0]]
             args[0] = c2
         else:

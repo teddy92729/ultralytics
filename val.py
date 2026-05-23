@@ -1,8 +1,10 @@
-from ultralytics import YOLO
+from ultralytics import YOLO, RTDETR
 
-model = YOLO("runs/obb/DV_YOLOv8s/weights/best.pt")
+model = YOLO("runs/obb/DV_Steam_Topk/weights/best.pt")
+# model = RTDETR("runs/detect/DV_RT-DETR_resnet50/weights/best.pt")
 
 results = model.val(
+    # data="/opt/datasets/DroneVehicle/VEDAI/YOLO1024/data.yaml",
     data="/opt/datasets/DroneVehicle/data.yaml",
     imgsz=640,
     device=0,
