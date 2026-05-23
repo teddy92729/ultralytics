@@ -3016,6 +3016,6 @@ class RegNet_lite(nn.Module):
 
         flow_diff = flow_as - flow_bs
 
-        warp_b = self.warp(b0, flow_diff)
+        warp_a = self.warp(a0, flow_diff)
 
-        return a0, warp_b
+        return warp_a, b0
