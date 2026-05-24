@@ -1,7 +1,7 @@
 from ultralytics import YOLO
 import cv2
 
-model = YOLO("runs/obb/DV_WarpNet/weights/best.pt")
+model = YOLO("runs/obb/DV_WarpNet_wo_aefm/weights/best.pt")
 
 img = cv2.imread("/opt/datasets/DroneVehicle/test/visible/images/00011.jpg", cv2.IMREAD_COLOR)
 img_t = cv2.imread("/opt/datasets/DroneVehicle/test/infrared/images/00011.jpg", cv2.IMREAD_GRAYSCALE)

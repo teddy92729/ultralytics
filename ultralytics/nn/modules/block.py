@@ -2940,7 +2940,9 @@ class RegBlk_lite(nn.Module):
             nn.Conv2d(kernel_size=1, stride=1, padding=0, in_channels=in_channel * 2, out_channels=in_channel), nn.LeakyReLU()
         )
 
-        self.crossAtt_prj = nn.Conv2d(in_channel, in_channel * 2, kernel_size=1, stride=1, padding=0)
+        self.crossAtt_prj1 = nn.Conv2d(in_channel, in_channel, kernel_size=1, stride=1, padding=0)
+        self.crossAtt_prj2 = nn.Conv2d(in_channel, in_channel * 2, kernel_size=1, stride=1, padding=0)
+
         self.mlp = nn.Sequential(
             nn.Conv2d(in_channel, in_channel // 4, kernel_size=1, stride=1, padding=0),
             nn.ReLU(),
@@ -2961,12 +2963,13 @@ class RegBlk_lite(nn.Module):
     def forward(self, d, f_cat):
         f_cat = self.conv1x1(f_cat)
 
-        f_cat_kv = self.crossAtt_prj(
+        d_q = self.crossAtt_prj1(d + positionalencoding2d(self.in_channel, d.shape[2], d.shape[3]).to(device=d.device, dtype=d.dtype))
+
+        f_cat_kv = self.crossAtt_prj2(
             f_cat + positionalencoding2d(self.in_channel, f_cat.shape[2], f_cat.shape[3]).to(device=f_cat.device, dtype=f_cat.dtype)
         )
-        d_p = d + positionalencoding2d(self.in_channel, d.shape[2], d.shape[3]).to(device=d.device, dtype=d.dtype)
 
-        q = d_p.flatten(2)
+        q = d_q.flatten(2)
         k, v = f_cat_kv.flatten(2).chunk(2, dim=1)
 
         ctx = torch.einsum("bcl,bcn->bln", q, k) / math.sqrt(self.in_channel)
